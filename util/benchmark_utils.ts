@@ -1,5 +1,7 @@
 // Copyright 2018-2019 the Deno authors. All rights reserved. MIT license.
 
+import Benchmarks from "../pages/benchmarks";
+
 // How much to multiply time values in order to process log graphs properly.
 const TimeScaleFactor = 10000;
 
@@ -44,7 +46,7 @@ export interface Column {
 
 function getBenchmarkVarieties(
   data: BenchmarkRun[],
-  benchmarkName: BenchmarkName
+  benchmarkName: BenchmarkName,
 ): string[] {
   // Look at last sha hash.
   const last = data[data.length - 1];
@@ -53,7 +55,7 @@ function getBenchmarkVarieties(
 
 function createColumns(
   data: BenchmarkRun[],
-  benchmarkName: BenchmarkName
+  benchmarkName: BenchmarkName,
 ): Column[] {
   const varieties = getBenchmarkVarieties(data, benchmarkName);
   return varieties.map((variety) => ({
@@ -81,35 +83,92 @@ function createColumns(
 export function createNormalizedColumns(
   data: BenchmarkRun[],
   benchmarkName: BenchmarkName,
-  baselineBenchmark: BenchmarkName,
-  baselineVariety: string
 ): Column[] {
-  const varieties = getBenchmarkVarieties(data, benchmarkName);
-  return varieties.map((variety) => ({
-    name: variety,
-    data: data.map((d) => {
-      if (d[baselineBenchmark] != null) {
-        const bb = d[baselineBenchmark] as any;
-        if (bb[baselineVariety] != null) {
-          const baseline = bb[baselineVariety];
-          if (d[benchmarkName] != null) {
-            const b = d[benchmarkName] as any;
-            if (b[variety] != null && baseline !== 0) {
-              const v = b[variety];
-              if (benchmarkName === "benchmark") {
-                const meanValue = v ? v.mean : 0;
-                return meanValue || null;
-              } else {
-                return v / baseline;
-              }
-            }
-          }
-        }
-      }
-      return null;
-    }),
+  const data2 = data.map((p) => p[benchmarkName] as BenchmarkVariantsResultSet);
+
+  interface SeriesStats {
+    count: number;
+    sum: number;
+    values: number[];
+    stratifiedValues: number[];
+    normalizedValues: number[];
+  }
+  const seriesStats: { [name: string]: SeriesStats } = Object.create(null);
+  const zeroValues = () => new Array(data2.length).fill(0);
+  const getSeriesStats = (varietyName: string) =>
+    seriesStats[varietyName] ??
+      (seriesStats[varietyName] = {
+        count: 0,
+        sum: 0,
+        values: zeroValues(),
+        stratifiedValues: zeroValues(),
+        normalizedValues: zeroValues(),
+      });
+  for (const [k, v] of data2.flatMap(Object.entries).filter(([, v]) => !!v)) {
+    const stats = getSeriesStats(k);
+    stats.sum += v;
+    stats.count += 1;
+  }
+  for (const [varietyName, stats] of Object.entries(seriesStats)) {
+    // Use squares?
+    const stratificationScaleFactor = stats.sum != 0
+      ? stats.count / stats.sum
+      : 0;
+    for (let i = 0; i < data2.length; i++) {
+      const v = data2[i][varietyName] ?? 0;
+      stats.values[i] = v;
+      stats.stratifiedValues[i] = v * stratificationScaleFactor;
+    }
+  }
+  interface SampleStats {
+    count: number;
+    sum: number;
+    normalizationFactor: number;
+  }
+  const sampleStats: SampleStats[] = new Array(data2.length)
+    .fill(null).map((_, i) => {
+      const samples = Object.values(seriesStats).map((stats) =>
+        stats.stratifiedValues[i]
+      ).filter((v) => !!v);
+      const count = samples.length;
+      const sum = samples.reduce((acc, v) => acc + v, 0);
+      const normalizationFactor = sum > 0 ? count / sum : 0;
+      return { count, sum, normalizationFactor };
+    });
+  for (const stats of Object.values(seriesStats)) {
+    stats.normalizedValues = stats.stratifiedValues.map(
+      (v, i) => v * sampleStats[i].normalizationFactor,
+    );
+  }
+  const result = Object.entries(seriesStats).map(([name, stats]) => ({
+    name,
+    data: filter(stats.normalizedValues.map((v) => v || null)),
   }));
+  function filter(values: number[]): number[] {
+    const delay = 20;
+    let acc = 1;
+    const values2 = [...values];
+    for (let i = 0; i < values.length; i++) {
+      const v = values[i];
+      if (!v) continue;
+      acc = (v / delay) + (acc * (1 - (1 / delay)));
+      values2[i] = acc;
+    }
+    return values2;
+  }
+  const avgData = sampleStats.map((_, i) => {
+    const values = Object.values(seriesStats).map((stats) =>
+      stats.normalizedValues[i]
+    ).filter(Boolean);
+    const count = values.length;
+    const sum = values.reduce((acc, v) => acc + v, 0);
+    const avg = count > 0 ? sum / count : 1;
+    return avg;
+  });
+  result.push({ name: "average", data: avgData });
+  return result;
 }
+
 function createBinarySizeColumns(data: BenchmarkRun[]): Column[] {
   const propName = "binary_size";
   const last = data[data.length - 1]!;
@@ -267,14 +326,10 @@ export function reshape(data: BenchmarkRun[]): BenchmarkData {
   const normalizedReqPerSec = createNormalizedColumns(
     data,
     "req_per_sec",
-    "req_per_sec",
-    "hyper"
   );
   const normalizedProxy = createNormalizedColumns(
     data,
     "req_per_sec_proxy",
-    "req_per_sec",
-    "hyper"
   );
 
   return {
